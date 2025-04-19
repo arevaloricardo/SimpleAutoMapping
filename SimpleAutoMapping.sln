@@ -2,6 +2,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SimpleAutoMapping", "SimpleAutoMapping\SimpleAutoMapping.csproj", "{755F9E73-E423-4B88-AC21-89F5696452CA}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tests", "Tests\Tests.csproj", "{43CF6AEC-99E8-4604-8044-CA64A7FCA09D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +14,13 @@ Global
 		{755F9E73-E423-4B88-AC21-89F5696452CA}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{755F9E73-E423-4B88-AC21-89F5696452CA}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{755F9E73-E423-4B88-AC21-89F5696452CA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{43CF6AEC-99E8-4604-8044-CA64A7FCA09D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{43CF6AEC-99E8-4604-8044-CA64A7FCA09D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{43CF6AEC-99E8-4604-8044-CA64A7FCA09D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{43CF6AEC-99E8-4604-8044-CA64A7FCA09D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2601379F-2949-425F-B074-1FD7E3171F86}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2601379F-2949-425F-B074-1FD7E3171F86}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2601379F-2949-425F-B074-1FD7E3171F86}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2601379F-2949-425F-B074-1FD7E3171F86}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

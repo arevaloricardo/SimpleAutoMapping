@@ -19,15 +19,15 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="../icon.jpg">
+    <None Include="icon.jpg">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
-    <None Update="../LICENSE">
+    <None Include="LICENSE">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
-    <None Update="../README.md">
+    <None Include="README.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>

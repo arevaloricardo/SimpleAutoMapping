@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace SimpleAutoMapping
 {
@@ -789,21 +790,20 @@ namespace SimpleAutoMapping
     /// </summary>
     public static class Mapper
     {
-        // Cache mejorado con estructuras optimizadas
-        // Usamos lazily-initialized para mejor rendimiento en la primera operación
-        private static readonly Lazy<ConcurrentDictionary<Type, PropertyInfo[]>> _propertyCache = 
-            new(() => new ConcurrentDictionary<Type, PropertyInfo[]>());
-            
-        private static readonly Lazy<ConcurrentDictionary<PropertyInfo, Func<object, object>>> _getterCache = 
-            new(() => new ConcurrentDictionary<PropertyInfo, Func<object, object>>());
-            
-        private static readonly Lazy<ConcurrentDictionary<PropertyInfo, Action<object, object>>> _setterCache = 
-            new(() => new ConcurrentDictionary<PropertyInfo, Action<object, object>>());
-            
-        // Acceso inmutable a los cachés  
-        private static ConcurrentDictionary<Type, PropertyInfo[]> PropertyCache => _propertyCache.Value;
-        private static ConcurrentDictionary<PropertyInfo, Func<object, object>> GetterCache => _getterCache.Value;
-        private static ConcurrentDictionary<PropertyInfo, Action<object, object>> SetterCache => _setterCache.Value;
+        // Cache optimizado con estructuras de alto rendimiento
+        // Usamos dictionaries estáticos para mejor rendimiento
+        private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache = new();
+        private static readonly ConcurrentDictionary<PropertyInfo, Func<object, object>> _getterCache = new();
+        private static readonly ConcurrentDictionary<PropertyInfo, Action<object, object>> _setterCache = new();
+        
+        // Cache para tipos más comunes
+        private static readonly ConcurrentDictionary<Type, bool> _isPrimitiveTypeCache = new();
+        private static readonly ConcurrentDictionary<Type, bool> _isCollectionTypeCache = new();
+        private static readonly ConcurrentDictionary<Type, Type> _elementTypeCache = new();
+        private static readonly ConcurrentDictionary<(Type sourceType, Type destType), bool> _isAssignableCache = new();
+        
+        // Cache para expresiones compiladas de mapeo
+        private static readonly ConcurrentDictionary<(Type sourceType, Type destType), Delegate> _mappingDelegateCache = new();
         
         // Configuración global
         private static SimpleAutoMappingConfiguration _configuration = new();
@@ -937,7 +937,21 @@ namespace SimpleAutoMapping
             if (source == null)
                 return destination;
             
-            // Verificar si estamos tratando con un tipo derivado
+            // Verificar si hay un mapeo compilado en caché para este par de tipos
+            var key = (typeof(TSource), typeof(TDestination));
+            if (_mappingDelegateCache.TryGetValue(key, out var cachedDelegate) && 
+                !options.IgnoreNullValues && // Solo usar caché para mapeo completo, no parcial
+                source.GetType() == typeof(TSource)) // No usar caché para tipos derivados
+            {
+                // Si existe un delegado compilado, usarlo directamente
+                if (destination == null)
+                    destination = Activator.CreateInstance<TDestination>();
+                    
+                var mappingFunc = (Func<TSource, TDestination, TDestination>)cachedDelegate;
+                return mappingFunc(source, destination);
+            }
+
+            // Verificar si estamos tratando con un tipo derivado 
             var sourceType = source.GetType();
             if (sourceType != typeof(TSource))
             {
@@ -1022,15 +1036,301 @@ namespace SimpleAutoMapping
                 destination = Activator.CreateInstance<TDestination>();
 
             // Manejo especial para colecciones
-            if (Mapper.IsCollection(typeof(TSource)) && Mapper.IsCollection(typeof(TDestination)))
+            if (IsCollection(typeof(TSource)) && IsCollection(typeof(TDestination)))
             {
-                return MapCollection(source, destination, options, configuration);
+                return MapCollection<TSource, TDestination>(source, destination, options, configuration);
             }
+            
+            // Para mapeo directo sin condiciones especiales, crear y cachear un delegado optimizado
+            if (!options.IgnoreNullValues && 
+                options.CustomResolvers.Count == 0 && 
+                options.ValueTransformers.Count == 0 &&
+                source.GetType() == typeof(TSource))
+            {
+                // En lugar de intentar usar el método que falta, usaremos MapInternalWithReflection
+                // var mappingFunc = CompileMappingDelegate<TSource, TDestination>(options);
+                // _mappingDelegateCache[key] = mappingFunc;
+                // return mappingFunc(source, destination);
                 
+                // Usar el enfoque basado en reflexión para todos los casos
+                return MapInternalWithReflection(source, destination, options, configuration);
+            }
+            
+            // Si no se puede optimizar con delegados compilados, usar el enfoque basado en reflexión
+            return MapInternalWithReflection(source, destination, options, configuration);
+        }
+
+        /// <summary>
+        /// Mapeo específico para colecciones
+        /// </summary>
+        private static TDestination MapCollection<TSource, TDestination>(
+            TSource source,
+            TDestination destination,
+            MappingOptions<TSource, TDestination> options,
+            SimpleAutoMappingConfiguration configuration)
+            where TSource : class
+            where TDestination : class
+        {
+            if (source == null)
+                return destination;
+
+            // Obtener tipo de elemento para la colección origen y destino
+            Type sourceElementType = GetElementType(typeof(TSource));
+            Type destElementType = GetElementType(typeof(TDestination));
+            
+            // Convertir a IEnumerable para iteración genérica
+            var sourceCollection = source as IEnumerable;
+            
+            // Asegurarse que la colección destino es válida
+            if (destination == null)
+            {
+                destination = Activator.CreateInstance<TDestination>();
+            }
+            
+            // Si el destino es un array, necesitamos un enfoque especial
+            if (typeof(TDestination).IsArray)
+            {
+                // Convertir cada elemento y crear un nuevo array
+                var items = new List<object>();
+                foreach (var item in sourceCollection)
+                {
+                    if (item == null && options.IgnoreNullValues)
+                        continue;
+                        
+                    if (item == null)
+                    {
+                        items.Add(null);
+                        continue;
+                    }
+                    
+                    // Mapear el elemento según su tipo
+                    var sourceItemType = item.GetType();
+                    object destinationItem;
+                    
+                    if (destElementType.IsAssignableFrom(sourceItemType))
+                    {
+                        // Asignación directa si los tipos son compatibles
+                        destinationItem = item;
+                    }
+                    else
+                    {
+                        // Intentar mapeo complejo
+                        var itemOptions = configuration.GetMappingOptions(sourceItemType, destElementType);
+                        if (itemOptions != null)
+                        {
+                            destinationItem = MapObject(item, destElementType, itemOptions, configuration);
+                        }
+                        else
+                        {
+                            // Buscar si hay opciones para cualquier tipo base
+                            destinationItem = TryMapWithBaseTypeOptions(item, destElementType, configuration);
+                            
+                            if (destinationItem == null)
+                            {
+                                // Intentar conversión simple
+                                try
+                                {
+                                    destinationItem = Convert.ChangeType(item, destElementType);
+                                }
+                                catch
+                                {
+                                    // Si no se puede convertir, crear una nueva instancia y mapear por convención
+                                    if (!destElementType.IsValueType && destElementType.GetConstructor(Type.EmptyTypes) != null)
+                                    {
+                                        var destItem = Activator.CreateInstance(destElementType);
+                                        AutoMapByConvention(item, destItem, options.IgnoreNullValues);
+                                        destinationItem = destItem;
+                                    }
+                                    else
+                                    {
+                                        // Si todo lo demás falla, usar valor predeterminado
+                                        destinationItem = destElementType.IsValueType ? 
+                                            Activator.CreateInstance(destElementType) : null;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    items.Add(destinationItem);
+                }
+                
+                // Crear el array final
+                Array array = Array.CreateInstance(destElementType, items.Count);
+                for (int i = 0; i < items.Count; i++)
+                {
+                    array.SetValue(items[i], i);
+                }
+                
+                return (TDestination)(object)array;
+            }
+            else
+            {
+                // Limpiar la colección destino existente si es posible
+                var clearMethod = GetClearMethod(destination);
+                clearMethod?.Invoke(destination, null);
+                
+                // Obtener el método Add de la colección destino
+                var addMethod = GetAddMethod(destination);
+                if (addMethod == null)
+                    return destination; // No se puede agregar elementos
+                    
+                // Buscar opciones específicas para los elementos
+                var elementMappingOptions = TryGetElementMappingOptions(sourceElementType, destElementType, configuration);
+                
+                // Agregar cada elemento
+                foreach (var item in sourceCollection)
+                {
+                    if (item == null && options.IgnoreNullValues)
+                        continue;
+                        
+                    if (item == null)
+                    {
+                        addMethod.Invoke(destination, new object[] { null });
+                        continue;
+                    }
+                    
+                    // Mapear el elemento según su tipo
+                    var sourceItemType = item.GetType();
+                    object destinationItem;
+                    
+                    if (destElementType.IsAssignableFrom(sourceItemType))
+                    {
+                        // Asignación directa si los tipos son compatibles
+                        destinationItem = item;
+                    }
+                    else if (elementMappingOptions != null)
+                    {
+                        // Usar las opciones para mapear el elemento
+                        var destItem = Activator.CreateInstance(destElementType);
+                        destinationItem = MapObject(item, destItem, elementMappingOptions, configuration);
+                    }
+                    else
+                    {
+                        // Buscar si hay opciones para cualquier tipo base
+                        destinationItem = TryMapWithBaseTypeOptions(item, destElementType, configuration);
+                        
+                        if (destinationItem == null)
+                        {
+                            // Intentar conversión simple
+                            try
+                            {
+                                destinationItem = Convert.ChangeType(item, destElementType);
+                            }
+                            catch
+                            {
+                                // Intentar crear y mapear un objeto complejo
+                                if (!destElementType.IsValueType && destElementType.GetConstructor(Type.EmptyTypes) != null)
+                                {
+                                    var destItem = Activator.CreateInstance(destElementType);
+                                    AutoMapByConvention(item, destItem, options.IgnoreNullValues, options.PreserveNestedNullValues);
+                                    destinationItem = destItem;
+                                }
+                                else
+                                {
+                                    // Si no se puede convertir ni mapear, usar valor predeterminado
+                                    destinationItem = destElementType.IsValueType ? 
+                                        Activator.CreateInstance(destElementType) : null;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Agregar a la colección destino
+                    addMethod.Invoke(destination, new object[] { destinationItem });
+                }
+            }
+            
+            return destination;
+        }
+        
+        /// <summary>
+        /// Intenta obtener las opciones de mapeo para los elementos de una colección
+        /// </summary>
+        private static object TryGetElementMappingOptions(Type sourceElementType, Type destElementType, SimpleAutoMappingConfiguration configuration)
+        {
+            // Primero intentar obtener opciones directas
+            var options = configuration.GetMappingOptions(sourceElementType, destElementType);
+            if (options != null)
+                return options;
+                
+            // Si no hay opciones directas, buscar en tipos base
+            Type currentSourceType = sourceElementType;
+            while (currentSourceType != null && currentSourceType != typeof(object))
+            {
+                var baseOptions = configuration.GetMappingOptions(currentSourceType, destElementType);
+                if (baseOptions != null)
+                {
+                    // Adaptar opciones para el tipo concreto
+                    var adaptedOptionsType = typeof(MappingOptions<,>).MakeGenericType(sourceElementType, destElementType);
+                    var adaptedOptions = Activator.CreateInstance(adaptedOptionsType);
+                    
+                    // Copiar configuraciones básicas
+                    CopyBasicMappingOptions(baseOptions, adaptedOptions);
+                    
+                    return adaptedOptions;
+                }
+                
+                currentSourceType = currentSourceType.BaseType;
+            }
+            
+            return null;
+        }
+        
+        /// <summary>
+        /// Intenta mapear un objeto buscando opciones para cualquier tipo base
+        /// </summary>
+        private static object TryMapWithBaseTypeOptions(object sourceItem, Type destType, SimpleAutoMappingConfiguration configuration)
+        {
+            var sourceItemType = sourceItem.GetType();
+            Type currentSourceType = sourceItemType;
+            
+            while (currentSourceType != null && currentSourceType != typeof(object))
+            {
+                var baseOptions = configuration.GetMappingOptions(currentSourceType, destType);
+                if (baseOptions != null)
+                {
+                    // Crear objeto destino
+                    var destItem = Activator.CreateInstance(destType);
+                    
+                    // Adaptar opciones para el tipo concreto si es necesario
+                    if (currentSourceType != sourceItemType)
+                    {
+                        var adaptedOptionsType = typeof(MappingOptions<,>).MakeGenericType(sourceItemType, destType);
+                        var adaptedOptions = Activator.CreateInstance(adaptedOptionsType);
+                        
+                        // Copiar configuraciones básicas
+                        CopyBasicMappingOptions(baseOptions, adaptedOptions);
+                        
+                        // Usar opciones adaptadas
+                        return MapObject(sourceItem, destItem, adaptedOptions, configuration);
+                    }
+                    
+                    // Usar opciones encontradas
+                    return MapObject(sourceItem, destItem, baseOptions, configuration);
+                }
+                
+                currentSourceType = currentSourceType.BaseType;
+            }
+            
+            return null;
+        }
+
+        /// <summary>
+        /// Implementación del mapeo usando reflexión (para casos que no se pueden optimizar)
+        /// </summary>
+        private static TDestination MapInternalWithReflection<TSource, TDestination>(
+            TSource source,
+            TDestination destination,
+            MappingOptions<TSource, TDestination> options,
+            SimpleAutoMappingConfiguration configuration)
+            where TSource : class
+            where TDestination : class
+        {
             // Obtener propiedades destino (con caché)
-            var destPropsArray = PropertyCache.GetOrAdd(typeof(TDestination), 
+            var destPropsArray = _propertyCache.GetOrAdd(typeof(TDestination), 
                 t => t.GetProperties().Where(p => p.CanWrite).ToArray());
-                
+            
             foreach (var destProp in destPropsArray)
             {
                 // Verificar si hay un resolutor personalizado para la propiedad destino
@@ -1054,7 +1354,7 @@ namespace SimpleAutoMapping
                 }
                 
                 // Obtener propiedades fuente (con caché)
-                var sourceProps = PropertyCache.GetOrAdd(typeof(TSource), 
+                var sourceProps = _propertyCache.GetOrAdd(source.GetType(), 
                     t => t.GetProperties().Where(p => p.CanRead).ToArray());
                 
                 // Buscar la propiedad fuente
@@ -1083,26 +1383,7 @@ namespace SimpleAutoMapping
                 if (options.MapNestedObjects && value != null && 
                     IsCollection(value.GetType()) && IsCollection(destProp.PropertyType))
                 {
-                    var sourceCollection = value as IEnumerable;
-                    var destCollection = destProp.GetValue(destination);
-                    
-                    // Crear la colección destino si es nula
-                    if (destCollection == null)
-                    {
-                        destCollection = CreateCollection(destProp.PropertyType);
-                        if (destCollection != null)
-                        {
-                            SetPropertyValue(destination, destProp, destCollection);
-                        }
-                        else
-                        {
-                            continue; // No se pudo crear la colección
-                        }
-                    }
-                    
-                    // Mapear la colección
-                    MapCollectionProperty(sourceCollection, destCollection, destProp.PropertyType, 
-                        options.IgnoreNullValues, configuration);
+                    MapCollectionOptimized(value, destination, destProp, options.IgnoreNullValues, configuration);
                     continue;
                 }
                 
@@ -1111,42 +1392,7 @@ namespace SimpleAutoMapping
                     !IsPrimitiveType(value.GetType()) && !IsCollection(value.GetType()) && 
                     !IsPrimitiveType(destProp.PropertyType) && !IsCollection(destProp.PropertyType))
                 {
-                    var destValue = destProp.GetValue(destination);
-                    
-                    if (destValue == null && destProp.PropertyType.GetConstructor(Type.EmptyTypes) != null)
-                    {
-                        destValue = Activator.CreateInstance(destProp.PropertyType);
-                        SetPropertyValue(destination, destProp, destValue);
-                    }
-                    
-                    if (destValue != null)
-                    {
-                        var nestedOptions = configuration.GetMappingOptions(value.GetType(), destValue.GetType());
-                        
-                        if (nestedOptions != null)
-                        {
-                            // Copiar configuración de preservar nulos anidados
-                            if (options.GetType().GetProperty("PreserveNestedNullValues") != null && 
-                                nestedOptions.GetType().GetProperty("PreserveNestedNullValues") != null)
-                            {
-                                var preserveNulls = options.GetType().GetProperty("PreserveNestedNullValues").GetValue(options);
-                                nestedOptions.GetType().GetProperty("PreserveNestedNullValues").SetValue(nestedOptions, preserveNulls);
-                            }
-                            
-                            MapObject(value, destValue, nestedOptions, configuration);
-                        }
-                        else
-                        {
-                            // Mapeo automático por convención
-                            var preserveNulls = false;
-                            if (options.GetType().GetProperty("PreserveNestedNullValues") != null)
-                            {
-                                preserveNulls = (bool)options.GetType().GetProperty("PreserveNestedNullValues").GetValue(options);
-                            }
-                            
-                            AutoMapByConvention(value, destValue, options.IgnoreNullValues, preserveNulls);
-                        }
-                    }
+                    MapNestedObject(value, destination, destProp, options, configuration);
                     continue;
                 }
                 
@@ -1157,27 +1403,7 @@ namespace SimpleAutoMapping
                 }
                 else
                 {
-                    // Intentar usar conversor de tipos registrado
-                    var converter = configuration.GetTypeConverter(value?.GetType(), destProp.PropertyType);
-                    if (converter != null && value != null)
-                    {
-                        try
-                        {
-                            var convertedValue = converter(value);
-                            SetPropertyValue(destination, destProp, convertedValue);
-                        }
-                        catch { /* Ignorar errores de conversión */ }
-                    }
-                    else
-                    {
-                        // Intentar conversión estándar
-                        try
-                        {
-                            var convertedValue = Convert.ChangeType(value, destProp.PropertyType);
-                            SetPropertyValue(destination, destProp, convertedValue);
-                        }
-                        catch { /* Ignorar errores de conversión */ }
-                    }
+                    TryConvertAndSetValue(value, destination, destProp, configuration);
                 }
             }
             
@@ -1185,226 +1411,315 @@ namespace SimpleAutoMapping
         }
 
         /// <summary>
-        /// Mapea una colección completa de elementos
+        /// Versión optimizada del mapeo de colecciones
         /// </summary>
-        private static TDestination MapCollection<TSource, TDestination>(
-            TSource source, 
-            TDestination destination, 
-            MappingOptions<TSource, TDestination> options,
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void MapCollectionOptimized(
+            object sourceValue,
+            object destination,
+            PropertyInfo destProp,
+            bool ignoreNulls,
             SimpleAutoMappingConfiguration configuration)
-            where TSource : class
-            where TDestination : class
         {
-            var sourceCollection = source as IEnumerable;
+            var sourceCollection = sourceValue as IEnumerable;
+            var destCollection = destProp.GetValue(destination);
             
-            // Si la colección de destino es nula, hay que crearla
-            if (destination == null)
+            // Crear la colección destino si es nula
+            if (destCollection == null)
             {
-                // Manejo especial para arrays
-                if (typeof(TDestination).IsArray)
+                destCollection = CreateCollection(destProp.PropertyType);
+                if (destCollection != null)
                 {
-                    // Determinar tipo de elemento para arrays
-                    var destElementType = typeof(TDestination).GetElementType();
-                    if (destElementType == null)
-                        return null;
-                    
-                    // Contar elementos en la colección fuente
-                    int count = 0;
-                    foreach (var _ in sourceCollection)
-                        count++;
-                    
-                    // Crear array del tamaño correcto
-                    var array = Array.CreateInstance(destElementType, count);
-                    
-                    // Mapear cada elemento
-                    int index = 0;
-                    foreach (var sourceItem in sourceCollection)
-                    {
-                        if (sourceItem == null && options.IgnoreNullValues)
-                            continue;
-                        
-                        var destItem = MapElement(sourceItem, destElementType, configuration);
-                        array.SetValue(destItem, index++);
-                    }
-                    
-                    return array as TDestination;
+                    SetPropertyValue(destination, destProp, destCollection);
                 }
                 else
                 {
-                    // Para otros tipos de colecciones
-                    destination = CreateCollection(typeof(TDestination)) as TDestination;
-                    if (destination == null)
-                    {
-                        return null; // No se pudo crear la colección
-                    }
+                    return; // No se pudo crear la colección
                 }
             }
             
-            // Mapear elementos de la colección
-            MapCollectionProperty(sourceCollection, destination, typeof(TDestination), 
-                options.IgnoreNullValues, configuration);
-            
-            return destination;
+            // Mapear la colección optimizada
+            MapCollectionFast(sourceCollection, destCollection, destProp.PropertyType, ignoreNulls, configuration);
         }
-        
+
         /// <summary>
-        /// Mapea un elemento individual dentro de una colección
+        /// Implementación rápida para mapeo de colecciones
         /// </summary>
-        private static object MapElement(object sourceItem, Type destElementType, SimpleAutoMappingConfiguration configuration)
-        {
-            if (sourceItem == null)
-                return null;
-                
-            if (IsPrimitiveType(destElementType))
-            {
-                // Para tipos primitivos, hacer conversión directa
-                try 
-                {
-                    // Intentar usar conversor de tipos registrado
-                    var converter = configuration.GetTypeConverter(sourceItem.GetType(), destElementType);
-                    if (converter != null)
-                    {
-                        return converter(sourceItem);
-                    }
-                    
-                    // Intentar conversión estándar
-                    return Convert.ChangeType(sourceItem, destElementType);
-                }
-                catch
-                {
-                    return GetDefaultValue(destElementType);
-                }
-            }
-            else
-            {
-                // Para objetos complejos, hacer mapping recursivo
-                var sourceType = sourceItem.GetType();
-                var options = configuration.GetMappingOptions(sourceType, destElementType);
-                
-                if (options != null)
-                {
-                    // Crear instancia del elemento destino
-                    var destItem = destElementType.GetConstructor(Type.EmptyTypes) != null 
-                        ? Activator.CreateInstance(destElementType) 
-                        : null;
-                    
-                    if (destItem != null)
-                    {
-                        return MapObject(sourceItem, destItem, options, configuration);
-                    }
-                }
-            }
-            
-            return null;
-        }
-        
-        /// <summary>
-        /// Devuelve el valor predeterminado para un tipo
-        /// </summary>
-        private static object GetDefaultValue(Type type)
-        {
-            return type.IsValueType ? Activator.CreateInstance(type) : null;
-        }
-        
-        /// <summary>
-        /// Mapeo de colecciones internas (propiedades tipo lista/array)
-        /// </summary>
-        private static void MapCollectionProperty(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void MapCollectionFast(
             IEnumerable sourceCollection, 
             object destCollection, 
             Type destCollectionType, 
             bool ignoreNulls,
             SimpleAutoMappingConfiguration configuration)
         {
-            // Obtener información del tipo de elemento de destino
-            Type destElementType = GetElementType(destCollectionType);
-            if (destElementType == null)
+            if (sourceCollection == null || destCollection == null)
                 return;
-                
-            // Obtener métodos para manipular la colección de destino
-            var addMethod = GetAddMethod(destCollection);
-            var clearMethod = GetClearMethod(destCollection);
             
-            if (addMethod == null)
-                return;
-                
-            // Limpiar colección destino si es posible
+            // Obtener el tipo de elemento de la colección destino
+            var destElementType = GetElementType(destCollectionType);
+            
+            // Limpiar la colección destino existente si es posible
+            var clearMethod = GetClearMethod(destCollection);
             clearMethod?.Invoke(destCollection, null);
             
-            // Mapear elementos
+            // Obtener el método Add de la colección destino
+            var addMethod = GetAddMethod(destCollection);
+            if (addMethod == null)
+                return; // No se puede agregar elementos
+            
+            // Agregar cada elemento con conversión rápida
             foreach (var sourceItem in sourceCollection)
             {
                 if (sourceItem == null && ignoreNulls)
                     continue;
-                    
-                object destItem;
                 
-                if (IsPrimitiveType(destElementType))
+                if (sourceItem == null)
                 {
-                    // Para tipos primitivos, hacer conversión directa
-                    try 
-                    {
-                        // Intentar usar conversor de tipos registrado
-                        if (sourceItem != null)
-                        {
-                            var converter = configuration.GetTypeConverter(sourceItem.GetType(), destElementType);
-                            if (converter != null)
-                            {
-                                destItem = converter(sourceItem);
-                            }
-                            else
-                            {
-                                destItem = Convert.ChangeType(sourceItem, destElementType);
-                            }
-                        }
-                        else
-                        {
-                            destItem = null;
-                        }
-                    }
-                    catch
-                    {
-                        continue; // Skip si no se puede convertir
-                    }
+                    addMethod.Invoke(destCollection, new object[] { null });
+                    continue;
+                }
+                
+                // Mapear el elemento según su tipo
+                var sourceItemType = sourceItem.GetType();
+                object destinationItem;
+                
+                if (destElementType.IsAssignableFrom(sourceItemType))
+                {
+                    // Asignación directa si los tipos son compatibles
+                    destinationItem = sourceItem;
                 }
                 else
                 {
-                    // Para objetos complejos, crear instancia y mapear
-                    if (destElementType.GetConstructor(Type.EmptyTypes) == null)
-                        continue; // Skip si no tiene constructor sin parámetros
-                        
-                    destItem = Activator.CreateInstance(destElementType);
+                    // Verificar si hay mapeo específico para el tipo del elemento
+                    var specificOptions = configuration.GetMappingOptions(sourceItemType, destElementType);
                     
-                    if (sourceItem != null)
+                    if (specificOptions != null)
                     {
-                        var sourceItemType = sourceItem.GetType();
-                        
-                        // Verificar si existe mapeo configurado
-                        var itemOptions = configuration.GetMappingOptions(sourceItemType, destElementType);
-                        
-                        if (itemOptions != null)
+                        // Crear una instancia del elemento destino
+                        var destItem = Activator.CreateInstance(destElementType);
+                        // Usar MapObject en lugar de un convertidor específico
+                        destinationItem = MapObject(sourceItem, destItem, specificOptions, configuration);
+                    }
+                    else
+                    {
+                        // Intentar conversión simple
+                        var converter = configuration.GetTypeConverter(sourceItemType, destElementType);
+                        if (converter != null)
                         {
-                            MapObject(sourceItem, destItem, itemOptions, configuration);
+                            try
+                            {
+                                destinationItem = converter(sourceItem);
+                            }
+                            catch
+                            {
+                                try
+                                {
+                                    destinationItem = Convert.ChangeType(sourceItem, destElementType);
+                                }
+                                catch
+                                {
+                                    if (!destElementType.IsValueType && destElementType.GetConstructor(Type.EmptyTypes) != null)
+                                    {
+                                        var destItem = Activator.CreateInstance(destElementType);
+                                        AutoMapByConvention(sourceItem, destItem, ignoreNulls);
+                                        destinationItem = destItem;
+                                    }
+                                    else
+                                    {
+                                        destinationItem = destElementType.IsValueType ? 
+                                            Activator.CreateInstance(destElementType) : null;
+                                    }
+                                }
+                            }
                         }
                         else
                         {
-                            // Mapeo automático por convención
-                            AutoMapByConvention(sourceItem, destItem, ignoreNulls);
+                            try
+                            {
+                                destinationItem = Convert.ChangeType(sourceItem, destElementType);
+                            }
+                            catch
+                            {
+                                if (!destElementType.IsValueType && destElementType.GetConstructor(Type.EmptyTypes) != null)
+                                {
+                                    var destItem = Activator.CreateInstance(destElementType);
+                                    AutoMapByConvention(sourceItem, destItem, ignoreNulls);
+                                    destinationItem = destItem;
+                                }
+                                else
+                                {
+                                    destinationItem = destElementType.IsValueType ? 
+                                        Activator.CreateInstance(destElementType) : null;
+                                }
+                            }
                         }
                     }
                 }
                 
-                // Agregar elemento a la colección destino
-                addMethod.Invoke(destCollection, new[] { destItem });
+                // Agregar a la colección destino
+                addMethod.Invoke(destCollection, new object[] { destinationItem });
             }
         }
-        
+
+        /// <summary>
+        /// Versión optimizada del mapeo de objetos anidados
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void MapNestedObject(
+            object value, 
+            object destination, 
+            PropertyInfo destProp,
+            object options,
+            SimpleAutoMappingConfiguration configuration)
+        {
+            if (value == null)
+                return;
+            
+            var destValue = destProp.GetValue(destination);
+            
+            // Si el valor destino es null, necesitamos crear una instancia
+            if (destValue == null)
+            {
+                if (destProp.PropertyType.GetConstructor(Type.EmptyTypes) != null)
+                {
+                    destValue = Activator.CreateInstance(destProp.PropertyType);
+                    SetPropertyValue(destination, destProp, destValue);
+                }
+                else
+                {
+                    // No podemos crear una instancia del tipo destino - posiblemente un tipo de interface
+                    return;
+                }
+            }
+            
+            var sourceType = value.GetType();
+            var destType = destValue.GetType();
+            
+            // Buscar opciones específicas para los tipos de los objetos anidados
+            var nestedOptions = configuration.GetMappingOptions(sourceType, destType);
+            
+            if (nestedOptions != null)
+            {
+                // Copiar configuración de preservar nulos anidados
+                CopyNestedNullsConfig(options, nestedOptions);
+                
+                // Mapear usando las opciones específicas
+                MapObject(value, destValue, nestedOptions, configuration);
+            }
+            else
+            {
+                // Verificar si hay opciones para cualquier tipo base del tipo fuente
+                Type currentSourceBaseType = sourceType.BaseType;
+                while (nestedOptions == null && currentSourceBaseType != null && currentSourceBaseType != typeof(object))
+                {
+                    nestedOptions = configuration.GetMappingOptions(currentSourceBaseType, destType);
+                    if (nestedOptions != null)
+                    {
+                        // Encontramos opciones para un tipo base, adaptarlas para el tipo actual
+                        var adaptedOptionsType = typeof(MappingOptions<,>).MakeGenericType(sourceType, destType);
+                        var adaptedOptions = Activator.CreateInstance(adaptedOptionsType);
+                        
+                        // Copiar configuraciones básicas
+                        CopyBasicMappingOptions(nestedOptions, adaptedOptions);
+                        // Copiar configuración de nulos anidados
+                        CopyNestedNullsConfig(options, adaptedOptions);
+                        
+                        // Mapear usando las opciones adaptadas
+                        MapObject(value, destValue, adaptedOptions, configuration);
+                        return;
+                    }
+                    
+                    currentSourceBaseType = currentSourceBaseType.BaseType;
+                }
+                
+                // Si no encontramos ninguna opción específica, usar mapeo automático por convención
+                var preserveNulls = GetPreserveNestedNullsValue(options);
+                AutoMapByConvention(value, destValue, GetIgnoreNullsValue(options), preserveNulls);
+            }
+        }
+
+        /// <summary>
+        /// Obtiene el valor de IgnoreNullValues de opciones usando reflection
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool GetIgnoreNullsValue(object options)
+        {
+            var prop = options.GetType().GetProperty("IgnoreNullValues");
+            return prop != null && (bool)prop.GetValue(options);
+        }
+
+        /// <summary>
+        /// Obtiene el valor de PreserveNestedNullValues de opciones usando reflection
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool GetPreserveNestedNullsValue(object options)
+        {
+            var prop = options.GetType().GetProperty("PreserveNestedNullValues");
+            return prop != null && (bool)prop.GetValue(options);
+        }
+
+        /// <summary>
+        /// Copia la configuración de PreserveNestedNullValues entre opciones
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void CopyNestedNullsConfig(object sourceOptions, object destOptions)
+        {
+            var sourceProp = sourceOptions.GetType().GetProperty("PreserveNestedNullValues");
+            var destProp = destOptions.GetType().GetProperty("PreserveNestedNullValues");
+            
+            if (sourceProp != null && destProp != null)
+            {
+                var preserveNulls = sourceProp.GetValue(sourceOptions);
+                destProp.SetValue(destOptions, preserveNulls);
+            }
+        }
+
+        /// <summary>
+        /// Intenta convertir y asignar un valor a una propiedad
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void TryConvertAndSetValue(
+            object value, 
+            object destination, 
+            PropertyInfo destProp,
+            SimpleAutoMappingConfiguration configuration)
+        {
+            if (value == null)
+                return;
+                
+            // Intentar usar conversor de tipos registrado
+            var converter = configuration.GetTypeConverter(value.GetType(), destProp.PropertyType);
+            if (converter != null)
+            {
+                try
+                {
+                    var convertedValue = converter(value);
+                    SetPropertyValue(destination, destProp, convertedValue);
+                }
+                catch { /* Ignorar errores de conversión */ }
+                return;
+            }
+            
+            // Intentar conversión estándar
+            try
+            {
+                var convertedValue = Convert.ChangeType(value, destProp.PropertyType);
+                SetPropertyValue(destination, destProp, convertedValue);
+            }
+            catch { /* Ignorar errores de conversión */ }
+        }
+
         /// <summary>
         /// Verifica si un tipo es primitivo o simple
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool IsPrimitiveType(Type type)
         {
-            return type.IsPrimitive || 
+            if (_isPrimitiveTypeCache.TryGetValue(type, out var isPrimitive))
+                return isPrimitive;
+                
+            return _isPrimitiveTypeCache[type] = type.IsPrimitive || 
                    type == typeof(string) || 
                    type == typeof(decimal) || 
                    type == typeof(DateTime) || 
@@ -1452,12 +1767,82 @@ namespace SimpleAutoMapping
                 }
             }
             
+            // Manejar tipos derivados: si las opciones son para un tipo base pero estamos mapeando un tipo derivado
+            var optionsType = options.GetType();
+            if (optionsType.IsGenericType && optionsType.GetGenericTypeDefinition() == typeof(MappingOptions<,>))
+            {
+                var optionsGenericArgs = optionsType.GetGenericArguments();
+                var optionsSourceType = optionsGenericArgs[0];
+                var optionsDestType = optionsGenericArgs[1];
+                
+                // Si el tipo de opciones no coincide exactamente con el tipo de origen real
+                if (optionsSourceType != sourceType && optionsSourceType.IsAssignableFrom(sourceType))
+                {
+                    // Buscar si existe un mapeo específico para el tipo derivado
+                    var derivedOptions = configuration.GetMappingOptions(sourceType, destType);
+                    if (derivedOptions != null)
+                    {
+                        options = derivedOptions; // Usar las opciones específicas del tipo derivado
+                    }
+                    else
+                    {
+                        // Si no hay opciones específicas, crear una versión adaptada de las opciones existentes
+                        // Esto evita el error "Cannot be converted to type..."
+                        var adaptedOptionsType = typeof(MappingOptions<,>).MakeGenericType(sourceType, destType);
+                        var adaptedOptions = Activator.CreateInstance(adaptedOptionsType);
+                        
+                        // Copiar propiedades básicas de configuración
+                        CopyBasicMappingOptions(options, adaptedOptions);
+                        
+                        options = adaptedOptions;
+                    }
+                }
+            }
+            
             // Invocar MapInternal con tipos correctos por reflexión
             var mapMethod = typeof(Mapper).GetMethod("MapInternal", 
                 BindingFlags.NonPublic | BindingFlags.Static);
                 
             var genericMethod = mapMethod.MakeGenericMethod(sourceType, destType);
             return genericMethod.Invoke(null, new[] { source, destination, options, configuration });
+        }
+        
+        /// <summary>
+        /// Copia las propiedades básicas de configuración entre dos objetos MappingOptions de tipos diferentes
+        /// </summary>
+        private static void CopyBasicMappingOptions(object source, object destination)
+        {
+            if (source == null || destination == null)
+                return;
+                
+            // Copiar configuración de IgnoreNullValues
+            var sourceIgnoreNullsProp = source.GetType().GetProperty("IgnoreNullValues");
+            var destIgnoreNullsProp = destination.GetType().GetProperty("IgnoreNullValues");
+            if (sourceIgnoreNullsProp != null && destIgnoreNullsProp != null)
+            {
+                var ignoreNulls = sourceIgnoreNullsProp.GetValue(source);
+                destIgnoreNullsProp.SetValue(destination, ignoreNulls);
+            }
+            
+            // Copiar configuración de MapNestedObjects
+            var sourceMapNestedProp = source.GetType().GetProperty("MapNestedObjects");
+            var destMapNestedProp = destination.GetType().GetProperty("MapNestedObjects");
+            if (sourceMapNestedProp != null && destMapNestedProp != null)
+            {
+                var mapNested = sourceMapNestedProp.GetValue(source);
+                destMapNestedProp.SetValue(destination, mapNested);
+            }
+            
+            // Copiar configuración de PreserveNestedNullValues
+            var sourcePreserveNestedProp = source.GetType().GetProperty("PreserveNestedNullValues");
+            var destPreserveNestedProp = destination.GetType().GetProperty("PreserveNestedNullValues");
+            if (sourcePreserveNestedProp != null && destPreserveNestedProp != null)
+            {
+                var preserveNested = sourcePreserveNestedProp.GetValue(source);
+                destPreserveNestedProp.SetValue(destination, preserveNested);
+            }
+            
+            // No copiamos PropertyMappings, ValueTransformers, etc. ya que esas configuraciones son específicas del tipo
         }
         
         /// <summary>
@@ -1520,9 +1905,28 @@ namespace SimpleAutoMapping
             var sourceType = source.GetType();
             var destType = destination.GetType();
             
+            // Verificar si podemos usar un delegado compilado
+            if (!ignoreNulls && !preserveNestedNulls)
+            {
+                var key = (sourceType, destType);
+                if (_mappingDelegateCache.TryGetValue(key, out var mappingDelegate))
+                {
+                    // Ejecutar el delegado compilado
+                    ((Action<object, object>)mappingDelegate)(source, destination);
+                    return;
+                }
+                
+                // Compilar un nuevo delegado para este par de tipos
+                var conversionDelegate = CompileAutoMapDelegate(sourceType, destType);
+                _mappingDelegateCache[key] = conversionDelegate;
+                conversionDelegate(source, destination);
+                return;
+            }
+            
+            // Si no podemos usar un delegado, usar el enfoque basado en reflexión
             // Obtener propiedades fuente y destino
-            var sourceProps = PropertyCache.GetOrAdd(sourceType, t => t.GetProperties().Where(p => p.CanRead).ToArray());
-            var destProps = PropertyCache.GetOrAdd(destType, t => t.GetProperties().Where(p => p.CanWrite).ToArray());
+            var sourceProps = _propertyCache.GetOrAdd(sourceType, t => t.GetProperties().Where(p => p.CanRead).ToArray());
+            var destProps = _propertyCache.GetOrAdd(destType, t => t.GetProperties().Where(p => p.CanWrite).ToArray());
             
             // Mapear propiedades por nombre
             foreach (var sourceProp in sourceProps)
@@ -1574,11 +1978,85 @@ namespace SimpleAutoMapping
         }
         
         /// <summary>
+        /// Compila un delegado optimizado para mapeo automático por convención
+        /// </summary>
+        private static Action<object, object> CompileAutoMapDelegate(Type sourceType, Type destType)
+        {
+            var sourceParam = Expression.Parameter(typeof(object), "source");
+            var destParam = Expression.Parameter(typeof(object), "dest");
+            
+            var typedSourceParam = Expression.Convert(sourceParam, sourceType);
+            var typedDestParam = Expression.Convert(destParam, destType);
+            
+            var expressions = new List<Expression>();
+            
+            // Obtener propiedades fuente y destino
+            var sourceProps = _propertyCache.GetOrAdd(sourceType, t => t.GetProperties().Where(p => p.CanRead).ToArray());
+            var destProps = _propertyCache.GetOrAdd(destType, t => t.GetProperties().Where(p => p.CanWrite).ToArray());
+            
+            // Mapear propiedades por nombre
+            foreach (var sourceProp in sourceProps)
+            {
+                // Buscar propiedad destino con el mismo nombre
+                var destProp = destProps.FirstOrDefault(
+                    p => p.Name.Equals(sourceProp.Name, StringComparison.OrdinalIgnoreCase));
+                    
+                if (destProp == null)
+                    continue;
+                    
+                // Si los tipos son compatibles directamente
+                if (destProp.PropertyType.IsAssignableFrom(sourceProp.PropertyType))
+                {
+                    // source.Property
+                    var sourceAccess = Expression.Property(typedSourceParam, sourceProp);
+                    // dest.Property = source.Property
+                    var assignment = Expression.Assign(
+                        Expression.Property(typedDestParam, destProp),
+                        sourceAccess);
+                    expressions.Add(assignment);
+                }
+                else
+                {
+                    // Intentar conversión si es simple
+                    try
+                    {
+                        // source.Property
+                        var sourceAccess = Expression.Property(typedSourceParam, sourceProp);
+                        // (DestPropType)source.Property
+                        var converted = Expression.Convert(sourceAccess, destProp.PropertyType);
+                        // dest.Property = (DestPropType)source.Property
+                        var assignment = Expression.Assign(
+                            Expression.Property(typedDestParam, destProp),
+                            converted);
+                        expressions.Add(assignment);
+                    }
+                    catch { /* Ignorar errores en la generación de expresiones */ }
+                }
+            }
+            
+            // Si no hay expresiones, devolver un delegado vacío
+            if (expressions.Count == 0)
+            {
+                return (_, __) => { };
+            }
+            
+            // Crear bloque con todas las expresiones
+            var block = Expression.Block(expressions);
+            
+            // Compilar lambda
+            return Expression.Lambda<Action<object, object>>(block, sourceParam, destParam).Compile();
+        }
+        
+        /// <summary>
         /// Obtiene un getter optimizado para una propiedad
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Func<object, object> GetOrCreateGetter(PropertyInfo property)
         {
-            return GetterCache.GetOrAdd(property, prop => 
+            if (_getterCache.TryGetValue(property, out var getter))
+                return getter;
+                
+            return _getterCache.GetOrAdd(property, prop => 
             {
                 // Compilar expresión lambda optimizada para el getter
                 var instance = Expression.Parameter(typeof(object), "instance");
@@ -1593,9 +2071,16 @@ namespace SimpleAutoMapping
         /// <summary>
         /// Configura un valor de propiedad usando setters compilados
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void SetPropertyValue(object target, PropertyInfo property, object value)
         {
-            var setter = SetterCache.GetOrAdd(property, prop => 
+            if (_setterCache.TryGetValue(property, out var setter))
+            {
+                setter(target, value);
+                return;
+            }
+            
+            setter = _setterCache.GetOrAdd(property, prop => 
             {
                 if (!prop.CanWrite)
                     return (_, __) => { }; // No-op
@@ -1618,21 +2103,29 @@ namespace SimpleAutoMapping
         /// <summary>
         /// Verifica si un tipo es una colección
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IsCollection(Type type)
         {
-            if (type == typeof(string))
-                return false;
+            if (_isCollectionTypeCache.TryGetValue(type, out var isCollection))
+                return isCollection;
                 
-            return typeof(IEnumerable).IsAssignableFrom(type);
+            if (type == typeof(string))
+                return _isCollectionTypeCache[type] = false;
+                
+            return _isCollectionTypeCache[type] = typeof(IEnumerable).IsAssignableFrom(type);
         }
         
         /// <summary>
         /// Obtiene el tipo de elemento de una colección
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Type GetElementType(Type collectionType)
         {
+            if (_elementTypeCache.TryGetValue(collectionType, out var elementType))
+                return elementType;
+                
             if (collectionType.IsArray)
-                return collectionType.GetElementType();
+                return _elementTypeCache[collectionType] = collectionType.GetElementType();
                 
             // Buscar implementaciones genéricas de IEnumerable<T>
             foreach (var iface in collectionType.GetInterfaces())
@@ -1640,7 +2133,7 @@ namespace SimpleAutoMapping
                 if (iface.IsGenericType && 
                     iface.GetGenericTypeDefinition() == typeof(IEnumerable<>))
                 {
-                    return iface.GetGenericArguments()[0];
+                    return _elementTypeCache[collectionType] = iface.GetGenericArguments()[0];
                 }
             }
             
@@ -1648,16 +2141,17 @@ namespace SimpleAutoMapping
             if (collectionType.IsGenericType && 
                 collectionType.GetGenericTypeDefinition() == typeof(IEnumerable<>))
             {
-                return collectionType.GetGenericArguments()[0];
+                return _elementTypeCache[collectionType] = collectionType.GetGenericArguments()[0];
             }
             
             // Si no se encuentra un tipo genérico, asumir Object
-            return typeof(object);
+            return _elementTypeCache[collectionType] = typeof(object);
         }
         
         /// <summary>
         /// Crea una instancia de colección del tipo especificado
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static object CreateCollection(Type collectionType)
         {
             // Para Arrays (no se pueden crear directamente, se usa List<T>)
@@ -1726,6 +2220,7 @@ namespace SimpleAutoMapping
         /// <summary>
         /// Obtiene el método Add de una colección
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static MethodInfo GetAddMethod(object collection)
         {
             var collectionType = collection.GetType();
@@ -1766,6 +2261,7 @@ namespace SimpleAutoMapping
         /// <summary>
         /// Obtiene el método Clear de una colección
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static MethodInfo GetClearMethod(object collection)
         {
             var collectionType = collection.GetType();
@@ -1804,9 +2300,30 @@ namespace SimpleAutoMapping
         /// </summary>
         public static void ClearCaches()
         {
-            PropertyCache.Clear();
-            GetterCache.Clear();
-            SetterCache.Clear();
+            // Verificación de seguridad para que no se produzcan errores si se llama múltiples veces
+            if (_propertyCache != null)
+                _propertyCache.Clear();
+                
+            if (_getterCache != null)
+                _getterCache.Clear();
+                
+            if (_setterCache != null)
+                _setterCache.Clear();
+                
+            if (_isPrimitiveTypeCache != null)
+                _isPrimitiveTypeCache.Clear();
+                
+            if (_isCollectionTypeCache != null)
+                _isCollectionTypeCache.Clear();
+                
+            if (_elementTypeCache != null)
+                _elementTypeCache.Clear();
+                
+            if (_isAssignableCache != null)
+                _isAssignableCache.Clear();
+                
+            if (_mappingDelegateCache != null)
+                _mappingDelegateCache.Clear();
         }
     }
     

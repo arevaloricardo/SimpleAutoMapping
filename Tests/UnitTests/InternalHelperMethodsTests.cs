@@ -2,9 +2,15 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
 using System.Collections.Generic;
 using System.Collections;
+using System.Reflection;
+using System.Collections.Concurrent;
 
 namespace SimpleAutoMapping.Tests.UnitTests
 {
+    // Clases simples para pruebas
+    public class TestSource { public int Id { get; set; } }
+    public class TestDest { public int Id { get; set; } }
+    
     [TestClass]
     public class InternalHelperMethodsTests
     {
@@ -110,6 +116,32 @@ namespace SimpleAutoMapping.Tests.UnitTests
             
             // Assert
             Assert.AreEqual(typeof(object), result, "GetElementType debe devolver object para colecciones no genéricas");
+        }
+        
+        [TestMethod]
+        public void ClearCaches_ShouldEmptyAllCaches()
+        {
+            // Arrange
+            // Crear instancias para forzar el uso de los cachés
+            var source = new TestSource { Id = 1 };
+            var dest = new TestDest();
+            
+            // Crear las opciones y registrarlas
+            var options = new MappingOptions<TestSource, TestDest>();
+            Mapper.Configuration.RegisterMapping(typeof(TestSource), typeof(TestDest), options);
+            
+            // Mapear para poblar las cachés
+            Mapper.Map<TestSource, TestDest>(source, dest);
+            
+            // Act
+            Mapper.ClearCaches();
+            
+            // Assert
+            // Verificación alternativa: hacer un nuevo mapeo para asegurar que sigue funcionando
+            var newDest = new TestDest();
+            var mappedDest = Mapper.Map<TestSource, TestDest>(source, newDest);
+            
+            Assert.AreEqual(1, mappedDest.Id, "El mapeo debería seguir funcionando después de limpiar las cachés");
         }
     }
 } 

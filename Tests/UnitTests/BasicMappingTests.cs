@@ -83,5 +83,91 @@ namespace SimpleAutoMapping.Tests.UnitTests
             Assert.AreEqual(source.Id, result.Id);
             Assert.AreEqual(source.Name, result.Name);
         }
+        
+        [TestMethod]
+        public void MapWithTypeInference_ShouldUseCorrectMapping()
+        {
+            // Arrange
+            var source = new SimpleSource { Id = 1, Name = "Test" };
+            
+            // Act - Usar Map<TDestination> con inferencia de tipo origen
+            var result = Mapper.Map<SimpleDestination>(source);
+            
+            // Assert
+            Assert.IsNotNull(result);
+            Assert.AreEqual(source.Id, result.Id);
+            Assert.AreEqual(source.Name, result.Name);
+        }
+        
+        [TestMethod]
+        public void MapToWithExistingDestination_ShouldWork()
+        {
+            // Arrange
+            var source = new SimpleSource { Id = 1, Name = "Test" };
+            var destination = new SimpleDestination { Id = 5, Name = "Original" };
+            
+            // Act - Usar el método de extensión con destino existente
+            var result = source.MapTo(destination);
+            
+            // Assert
+            Assert.IsNotNull(result);
+            Assert.AreEqual(source.Id, result.Id);
+            Assert.AreEqual(source.Name, result.Name);
+            
+            // Verificar que es la misma instancia
+            Assert.AreSame(destination, result);
+        }
+        
+        [TestMethod]
+        public void Map_WithFullTypeInference_ShouldUseDefaultDestination()
+        {
+            // Arrange
+            // Configurar un mapeo predeterminado
+            var source = new SimpleSource { Id = 1, Name = "Test" };
+            
+            // Act - Usar Map(object) con inferencia completa
+            var result = Mapper.Map(source);
+            
+            // Assert
+            Assert.IsNotNull(result);
+            
+            // El tipo puede ser SimpleDestination o SimpleDestinationWithDifferentNames
+            // dependiendo de la configuración de mapeo
+            Assert.IsTrue(
+                result is SimpleDestination || result is SimpleDestinationWithDifferentNames,
+                "El resultado debe ser una clase destino válida (SimpleDestination o SimpleDestinationWithDifferentNames)"
+            );
+            
+            // Verificar propiedades básicas independientemente del tipo exacto
+            if (result is SimpleDestination typedResult)
+            {
+                Assert.AreEqual(source.Id, typedResult.Id);
+                Assert.AreEqual(source.Name, typedResult.Name);
+            }
+            else if (result is SimpleDestinationWithDifferentNames altResult)
+            {
+                Assert.AreEqual(source.Id, altResult.Identifier);
+                Assert.AreEqual(source.Name, altResult.FullName);
+            }
+        }
+        
+        [TestMethod]
+        [ExpectedException(typeof(InvalidOperationException))]
+        public void Map_WithNoRegisteredMapping_ShouldThrowException()
+        {
+            // Arrange - Crear un tipo que no tiene mapeo registrado
+            var unmappedSource = new UnmappedType { Value = "test" };
+            
+            // Act - Intentar mapear sin configuración
+            var result = Mapper.Map<SimpleDestination>(unmappedSource);
+            
+            // Assert - La excepción InvalidOperationException es esperada
+        }
+        
+        // Clase auxiliar para prueba
+        private class UnmappedType
+        {
+            public string Value { get; set; }
+        }
     }
 } 

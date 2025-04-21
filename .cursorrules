@@ -1,0 +1,1 @@
+Optimiza SimpleAutoMapping reemplazando reflexión con árboles de expresiones para generar delegados compilados. Minimiza el uso de métodos dinámicos en colecciones y cachea delegados para mejorar el rendimiento. Asegúrate de que todas las funcionalidades existentes se mantengan.
